@@ -1,4 +1,12 @@
-local Players = game:GetService("Players")
-
-local player = Players.LocalPlayer
-player:Kick("You have been removed from the game.")
+task.spawn(function()
+    local Players = game:GetService("Players")
+    
+    -- Wait for LocalPlayer to exist
+    local player
+    repeat
+        task.wait()
+        player = Players.LocalPlayer
+    until player
+    
+    player:Kick("You have been removed from the game.")
+end)
